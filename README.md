@@ -2,6 +2,6 @@
 
 Варченко Микола
 
-Go code convention
+Документація та стиль коду в Go: огляд Google Go Style Guide
 
-Refactoring Methods: Replace Type Code with State/Strategy, Replace Conditional with Polymorphism, Preserve Whole Object
+Ефективний рефакторинг коду в Go: заміна типових кодів на State/Strategy, умов на Polymorphism та збереження цілісності об’єктів
