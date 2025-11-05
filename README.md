@@ -2,6 +2,6 @@
 
 Варченко Микола
 
-Правила оформлення програмного коду у мові Go за стандартами Google Go Style Guide
+Правила оформлення коду Go за стандартами Google Go Style Guide
 
-Методи рефакторингу коду: Refactoring Methods: Replace Type Code with State/Strategy, Replace Conditional with Polymorphism, Preserve Whole Object на прикладі мови C#
+Методи рефакторингу коду: Replace Type Code with State/Strategy, Replace Conditional with Polymorphism, Preserve Whole Object на прикладі мови C#
