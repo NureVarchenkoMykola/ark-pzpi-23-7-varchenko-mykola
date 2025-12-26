@@ -1,0 +1,712 @@
+﻿Міністерство освіти і науки України
+Харківський національний університет радіоелектроніки
+Кафедра програмної інженерії
+
+
+
+
+
+
+Звіт
+з лабораторної роботи №3
+з предмету «Аналіз та рефакторинг коду»
+
+
+
+
+
+Виконав: 
+ст. гр. ПЗПІ 23-7
+Варченко Микола Миколайович
+
+Прийняв:
+Дашенков Д.С.
+
+
+
+
+
+
+
+Харків 2025
+    1 Бізнес логіка серверної частини
+     1.1 Автентифікація та контроль доступу до даних
+     Серверна частина працює з персональними даними користувача, тому доступ до основних функцій системи можливий лише після автентифікації. Для цього реалізовано модуль реєстрації і входу, а також middleware, який захищає всі маршрути, де виконуються операції з приладами, тарифами, споживанням, лімітами та звітами. Під час реєстрації сервер перевіряє, що користувач передав email і пароль, а також перевіряє унікальність email у базі даних, щоб не створювались дублікати. Пароль не зберігається у відкритому вигляді, замість цього він хешується через bcrypt, і вже хеш зберігається в таблиці користувачів. Це дозволяє виконувати перевірку правильності пароля під час входу без розкриття реального значення пароля.
+     Під час входу сервер шукає користувача за email і порівнює введений пароль з хешем у базі. Якщо облікові дані коректні, сервер формує JWT токен, у який записує ідентифікатор користувача. Далі токен використовується у кожному запиті до захищених ресурсів. Middleware авторизації бере заголовок Authorization, виділяє токен, перевіряє його валідність і підпис через секретний ключ, а потім встановлює у запиті користувача як об’єкт з id. Це є ключовою частиною бізнес-правила про ізоляцію даних, оскільки всі запити до БД в інших модулях фільтруються за user_id, що дорівнює id користувача з токена. Таким чином користувач може працювати лише зі своїми приладами, тарифами, записами споживання та лімітами, а доступ до чужих даних технічно блокується на рівні серверної логіки.
+     1.2 Логіка керування приладами
+     Функціональність приладів потрібна для того, щоб користувач міг вести облік джерел споживання і робити аналіз не тільки по датах, а й по конкретних пристроях. На сервері прилад завжди створюється з прив’язкою до користувача, тому в БД зберігається user_id і далі всі операції виконуються лише в межах цього користувача. Створення приладу має базову валідацію, оскільки назва є обов’язковою. Опис і орієнтовна потужність є додатковими полями, і якщо їх не передано, сервер зберігає null. Поле estimated_power відіграє роль у бізнес-логіці обліку споживання, тому що воно дозволяє автоматично отримати кВт*год, якщо користувач вводить не готові кВт*год, а години використання приладу.
+     Під час оновлення або видалення приладу сервер спочатку перевіряє, що прилад з таким id існує і належить поточному користувачу. Якщо запис не знайдено, сервер повертає повідомлення not found. Це знову реалізує правило доступу тільки до своїх даних. Оновлення зроблено так, щоб дозволити часткову зміну, тобто змінюються лише ті поля, які були передані, а решта зберігаються без змін.
+     1.3 Логіка тарифів і підтримка єдиного активного тарифу
+     Тариф у системі задає ціну за кВт*год, а також період дії тарифу, щоб можна було коректно описувати ситуації, коли ціна змінюється у часі. У реалізації тариф має назву, значення price_per_kwh, дату початку дії valid_from, а дату завершення valid_to можна не вказувати. Сервер перевіряє, щоб valid_from не була пізнішою за valid_to, інакше це створювало б некоректний інтервал.
+     Окреме бізнес-правило стосується активності тарифу. Система використовує активний тариф для автоматичного розрахунку вартості у модулях обліку споживання, тому сервер забезпечує, щоб одночасно був активний тільки один тариф користувача. Коли створюється новий тариф і він позначається активним, сервер у транзакції робить дві дії. Він створює новий тариф з is_active, після чого деактивує всі інші тарифи цього користувача. Транзакція потрібна для того, щоб система не залишалась у проміжному стані при помилці, наприклад коли новий тариф уже створився, а старі ще не вимкнулися. Аналогічна логіка працює під час оновлення існуючого тарифу та під час окремої операції активації тарифу. Якщо користувач активує тариф, сервер знову вимикає всі інші, і таким чином гарантує єдине джерело ціни для подальших розрахунків.
+     Додатково реалізована перевірка, що тариф може бути активним саме зараз. Сервер бере поточну дату і перевіряє, чи входить вона в діапазон дії тарифу. Якщо користувач намагається зробити активним тариф, який ще не почав діяти або вже завершився, сервер повертає помилку. Це не дозволяє системі використовувати в розрахунках тариф, який не відповідає реальним умовам, і підвищує коректність фінансових підсумків.
+     1.4 Облік споживання і автоматичний розрахунок вартості
+     Записи споживання є центральними даними системи. Кожний запис містить дату, величину споживання, опціональний зв’язок з приладом, а також вартість, яку сервер розраховує автоматично. На рівні бізнес-логіки сервер підтримує два способи введення споживання. Користувач може передати точне значення consumption_kwh, або може передати usage_hours, тобто кількість годин використання. Другий варіант потрібен, коли користувач не знає кВт*год напряму і хоче отримати їх через потужність приладу. Сервер навмисно забороняє передавати consumption_kwh і usage_hours одночасно, оскільки це створює суперечність, і система не повинна здогадуватися, яке поле вважати правильним.
+     Під час створення або редагування запису сервер перевіряє дату record_date. Валідація не обмежується тільки форматом, а також перевіряє, що дата реально існує в календарі. Аналогічні перевірки використовуються і в фільтрах на отримання списку записів, щоб користувач не міг сформувати некоректний запит з date_from або date_to, і щоб не виникало ситуацій, коли date_from більша за date_to. 
+     Дуже важливим правилом є вимога наявності рівно одного активного тарифу для розрахунку. Перед тим як створити або оновити запис, сервер шукає активні тарифи користувача. Якщо активного тарифу немає, сервер відмовляє і пояснює, що потрібно створити тариф і зробити його активним. Якщо активних тарифів більше одного, сервер повертає конфлікт, оскільки при такому стані розрахунок вартості був би неоднозначним. Додатково у відповіді сервер може повертати ідентифікатори знайдених активних тарифів, щоб користувач міг швидко виправити ситуацію.
+     Коли споживання вводиться через usage_hours, сервер вимагає appliance_id і перевіряє, що прилад належить користувачу. Далі сервер бере estimated_power приладу, перевіряє, що воно задане і більше нуля, і лише після цього обчислює кВт*год як добуток потужності на години. Якщо estimated_power не встановлене, сервер повертає помилку і пояснює, що спочатку потрібно заповнити потужність приладу. Таким чином система не створює записів із випадково порахованими значеннями.
+     Після отримання kWh сервер рахує ціну. Він бере price_per_kwh з активного тарифу, перевіряє, що воно є числом і не від’ємне, і обчислює суму як kWh помножене на ціну. У коді також нормалізується значення до заданої кількості знаків після коми, щоб дані були акуратними і передбачуваними у звітах. Разом із вартістю у запис зберігається applied_price_per_kwh. Це робиться для прозорості і відтворюваності, щоб у кожному записі було видно, яку саме ціну застосував сервер, навіть якщо користувач потім створить інший тариф. В оновленні запису ця логіка повторюється, тому будь-яка зміна запису приводить до перерахунку вартості на основі активного тарифу на момент редагування. Такий підхід забезпечує узгодженість даних і виконання правила, що підсумки мають бути коректними після правок.
+     1.5 Ліміти та механізм контролю перевищення
+     Ліміти призначені для того, щоб користувач міг задати допустимий рівень споживання на вибраний період і своєчасно отримувати попередження, коли фактичні витрати наближаються до встановленої межі. Сервер підтримує кілька типів періодів, тому бізнес-логіка в цьому модулі зводиться до двох ключових задач. Перша задача полягає у коректному формуванні меж періоду, друга задача полягає в обчисленні прогресу та визначенні статусу використання ліміту.
+     Під час створення ліміту сервер перевіряє значення period_type і не приймає варіанти, які не входять до дозволеного набору. Дата period_start є обов’язковою і проходить календарну валідацію, щоб уникнути помилок формату або неіснуючих дат. Далі виконується обробка period_end. Для типу custom дата завершення є обов’язковою і не може бути раніше за дату початку, оскільки це створює некоректний інтервал. Для типів week, month та year дата завершення визначається автоматично на основі period_start. Для тижня кінець періоду встановлюється через шість днів після початку. Для month додається місяць та віднімається один день. Для року аналогічно додається рік та віднімається один день. Додатково передбачено перевірку узгодженості, коли period_end передається користувачем для автоматичних типів, тоді сервер звіряє його з очікуваним значенням і у випадку невідповідності повертає помилку з підказкою правильного expected_period_end. Завдяки цьому межі періоду не можуть бути довільно змінені і поведінка системи залишається стабільною.
+     Значення limit_kwh повинно бути додатним числом, тому сервер відхиляє нульові або від’ємні значення. Налаштування попереджень також проходять валідацію. Поле alert_enabled повинно бути булевим значенням, а alert_threshold_percent повинно бути цілим числом у межах від 1 до 100. Якщо ці параметри не передані, використовуються значення за замовчуванням, щоб механізм попередження працював одразу після створення ліміту і не вимагав додаткового налаштування.
+     Важливою бізнес-вимогою є уникнення конфліктів між лімітами. Сервер не дозволяє створювати для одного й того ж типу періоду кілька лімітів, які перекриваються за датами. Перед створенням і оновленням виконується пошук перетинів, коли початок одного інтервалу не пізніше кінця іншого, а кінець не раніше початку. Якщо перетин знайдено, повертається конфлікт і вказується існуючий ідентифікатор ліміту. Це робить правила однозначними і не допускає ситуації, коли на один і той самий проміжок одночасно діє кілька лімітів.
+     Прогрес ліміту обчислюється на запит. Сервер бере period_start і period_end конкретного ліміту, підсумовує consumption_kwh користувача за всі записи в межах цього інтервалу та отримує фактичне використання used_kwh. Далі обчислюється percent_used, після чого формуються логічні ознаки threshold_reached та limit_exceeded. Поріг вважається досягнутим, якщо попередження увімкнене і відсоток використання перевищив заданий threshold. Перевищення ліміту визначається при досягненні ста відсотків або більше. У підсумку повертаються не лише числа, а й готовий стан, який можна без додаткових обчислень використати в інтерфейсі для повідомлень і візуальних індикаторів.
+     1.6 Логіка формування звітів і аналітики
+     Звітність у системі побудована так, щоб користувач отримував зрозумілу картину споживання за вибраний період, бачив динаміку по днях і міг оцінити розподіл витрат за приладами. Під час формування звітів сервер вимагає коректні межі періоду date_from та date_to і не дозволяє будувати звіт без визначених дат або з некоректними значеннями. Це важливо, оскільки результати аналітики безпосередньо залежать від правильно обраного проміжку часу і використовуються для прийняття рішень щодо економії або зміни поведінки споживання.
+     Підсумковий звіт за період реалізовано через агрегацію даних у базі. Сервер обчислює суму спожитих кВт*год, суму вартості та кількість записів за заданий проміжок. Окремо визначається день з максимальним сумарним споживанням. Для цього дані групуються за record_date і результат упорядковується за сумою кВт*год, що дозволяє знайти день з найбільшим навантаженням. Після отримання підсумків обчислюються середні значення, зокрема кВт*год на день і вартість на день, а також кВт*год на один запис і вартість на один запис. Щоб середні значення були коректними саме для календарного періоду, сервер окремо визначає кількість днів у проміжку включно на основі різниці дат, тому середні показники не залежать від того, скільки записів було внесено в окремі дні.
+     Денний звіт формує часовий ряд. Дані групуються за датою, і для кожного дня повертаються сумарні кВт*год, сумарна вартість і кількість записів. Такий результат зручний для побудови графіків і таблиць, оскільки клієнтська частина отримує вже агреговані значення без додаткових обчислень.
+     Звіт розподілу за приладами групує записи за appliance_id та підсумовує кВт*год і вартість. Оскільки групування повертає лише ідентифікатори приладів, сервер додатково добирає назви приладів поточного користувача для знайдених id і формує результат, у якому поряд з appliance_id присутній appliance_name. Якщо частина записів не прив’язана до приладу, appliance_id може бути null, і це обробляється коректно без порушення структури звіту.
+     Окремо передбачено звіт по лімітах, який поєднує налаштовані ліміти та фактичне споживання. Сервер виконує запит з LEFT JOIN, що дозволяє для кожного ліміту підрахувати used_kwh як суму споживання в межах періоду цього ліміту, навіть якщо записів у проміжку немає. Після отримання даних виконується нормалізація, обчислюється percent_used, визначається remaining_kwh і присвоюється статус. Статус класифікується як ok, threshold_reached або limit_exceeded, що дає змогу відбирати лише проблемні випадки або, навпаки, переглядати тільки ліміти без ризику перевищення. Фільтри period_type, ids, status та опціональний період перекриття реалізовані так, щоб можна було переглядати як загальну картину, так і обмежену вибірку, наприклад лише місячні ліміти або лише ті, що досягли порогу.
+     1.7 Експорт звітів і узгодженість результатів
+     Для практичного використання аналітики реалізовано експорт звітів у CSV. Сервер формує файл із заголовками та рядками даних, додає маркер кодування для коректного відкриття в Excel і використовує роздільник, зручний для локалізованого середовища. Для числових значень виконується нормалізація, щоб десяткові дроби відображалися коректно у табличних редакторах. Експорт будується на тих самих обчисленнях, що і відповіді у форматі JSON, тому дані в CSV узгоджуються з тим, що повертає API.
+     Узгодженість результатів забезпечується тим, що ключові значення, зокрема cost та applied_price_per_kwh, розраховуються саме на сервері, а не приймаються з клієнта як готовий результат. Це важливо, оскільки клієнтська частина може надіслати некоректні дані або бути зміненою, тоді як сервер завжди застосовує однакові правила. Перед збереженням перевіряються умови тарифу та валідність вхідних значень, і лише після цього формується підсумковий розрахунок. Завдяки цьому підсумки у звітах залишаються стабільними, а бізнес-правила контролюються централізовано на серверній стороні.
+
+
+
+
+    2 Функції адміністрування серверної частини
+     Модуль адміністрування додано до серверної частини для керування обліковими записами та контролю безпеки на рівні доступу. Сервер побудований на Node.js з Express.js, використовує JWT автентифікацію та працює з MySQL через Sequelize, а документація API доступна у Swagger UI. У межах адміністрування це означає, що всі операції виконуються як захищені HTTP запити, а права доступу перевіряються до виконання бізнес дій.
+     Доступ до адміністративних ендпоінтів відкритий лише для користувачів з роллю admin. Для цього використовується загальний middleware авторизації, який перевіряє токен і визначає поточного користувача, а також додатковий контроль ролі, що блокує будь які запити від неадміністраторів. Такий підхід дозволяє ізолювати адміністративні можливості від звичайного функціоналу та зменшує ризик випадкового або несанкціонованого втручання. Для керування обліковими записами реалізовано ендпоінт отримання списку користувачів, який підтримує фільтрацію та пагінацію. Запит до /api/admin/users дозволяє знаходити акаунти за частиною email, відбирати за роллю та станом блокування, а також отримувати результати частинами через limit та offset. Відповідь повертає загальну кількість знайдених записів і поточний список, що дає змогу використовувати це як основу для адміністративної панелі та для перевірки стану системи.
+     Зміна прав доступу винесена в окремий ендпоінт /api/admin/users/{id}/role. При виконанні перевіряється коректність ідентифікатора та допустимість нової ролі, а також введено захист від небезпечних сценаріїв, коли адміністратор намагається змінити роль самому собі або коли система може залишитися без активних адміністраторів. Аналогічно реалізовано блокування та розблокування через /api/admin/users/{id}/block, де додатково заборонено блокувати власний обліковий запис і застосовано правило збереження принаймні одного активного адміністратора, щоб адміністрування системи завжди залишалося можливим.
+     Для швидкої оцінки стану облікових записів реалізовано ендпоінт /api/admin/stats. Він повертає загальну кількість акаунтів і заблокованих акаунтів, окремо кількість звичайних користувачів і заблокованих користувачів, а також кількість адміністраторів і заблокованих адміністраторів. Це дозволяє адміністратору без додаткових вибірок одразу бачити ключові показники, які характеризують активність і можливі проблеми з доступом.
+     Для підвищення прозорості та відстеження дій адміністраторів додано аудит. Після критичних адміністративних операцій, таких як блокування, розблокування або зміна ролі, у таблицю audit_logs записується хто саме виконав дію, над ким вона виконана, який тип дії відбувся та коли саме це сталося. Додаткове поле meta зберігає службові деталі у вигляді тексту, наприклад попереднє та нове значення ролі або стану блокування. Перегляд історії реалізовано через /api/admin/audit-logs, який підтримує фільтр за конкретним admin_id, тому можна отримати дії одного адміністратора або загальну історію по всіх адміністраторах, а також використовувати limit та offset для зручного перегляду великих журналів.
+    3 Фрагменти програмного коду
+     3.1 Фрагменти коду бізнес логіки серверної частини
+     У розробленій системі бізнес-логіка зосереджена на обробці даних споживання, тарифів і лімітів, а також на формуванні звітів. Серверна частина не лише виконує CRUD-операції, а й реалізує обчислення, необхідні для аналітики, а саме підсумовування обсягів споживання, обчислення вартості за тарифом, агрегацію за часовими періодами та перевірку обмежень. Такі обчислення виконуються на стороні сервера. У наступних пунктах опишемо деякі ключові фрагменти коду.
+     3.1.1 Отримання та нормалізація вхідних даних для розрахунків
+     Для коректних обчислень сервер спочатку приводить вхідні значення до потрібних типів і перевіряє їхню валідність. Це важливо, оскільки значення споживання та параметри періоду надходять із запиту, а отже можуть мати різний формат. На цьому етапі формується основа для подальших математичних операцій і запобігаються помилки через некоректні дані. Це фрагмент коду з обробки ендпоінта апдейту запису споживання:
+router.patch('/:id', auth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id)
+    const row = await ConsumptionRecord.findOne({ where: { id, user_id: req.user.id } })
+    if (!row) return res.status(404).json({ message: 'not found' })
+
+    const { appliance_id, consumption_kwh, usage_hours, record_date, notes } = req.body || {}
+  
+    const hasKwh = consumption_kwh !== undefined && consumption_kwh !== null
+    const hasHours = usage_hours !== undefined && usage_hours !== null
+
+    if (hasKwh && hasHours) {
+    return res.status(400).json({ message: 'Provide either consumption_kwh or usage_hours, not both' })
+    }
+    const nextDate = record_date == null ? String(row.record_date) : String(record_date)
+    if (!isValidISODate(nextDate)) {
+      return res.status(400).json({ message: 'record_date must be YYYY-MM-DD' })
+    }
+    const tCheck = await getActiveTariffStrict(req.user.id)
+    if (!tCheck.ok) {
+      if (tCheck.code === 'NO_ACTIVE') {
+        return res.status(400).json({
+          message: 'No active tariff. Please create a tariff and set it as active.'
+        })
+      }
+      return res.status(409).json({
+        message: 'More than one active tariff found. Please leave only one active tariff.',
+        active_tariff_ids: tCheck.ids
+      })
+    }
+    const activeTariff = tCheck.tariff
+     3.1.2 Агрегація записів споживання за обраний період
+     Формування звітів потребує не окремих записів, а агрегованих значень. Тому сервер виконує відбір записів за часовими межами та підраховує сумарне споживання за період. Типово це реалізовано через сумування значень у вибірці або через агрегатні функції на рівні запиту до бази даних. У результаті отримуються узагальнені величини, які далі використовуються у звітах та перевірках лімітів. Це обробка ендпоінту отримання сумарного звіту: 
+       router.get('/summary', auth, async (req, res, next) => {
+         try {
+           const period = requirePeriod(req, res)
+           if (!period) return
+       
+           const { dateFrom, dateTo } = period
+           const where = buildWhere(req.user.id, dateFrom, dateTo)
+           const days = daysInclusive(dateFrom, dateTo)
+       
+           const totalsRow = await ConsumptionRecord.findOne({
+             where,
+             attributes: [
+               [sequelize.fn('SUM', sequelize.col('consumption_kwh')), 'total_kwh'],
+               [sequelize.fn('SUM', sequelize.col('cost')), 'total_cost'],
+               [sequelize.fn('COUNT', sequelize.col('id')), 'records_count']
+             ],
+             raw: true
+           })
+       
+           const totalKwh = toNumber(totalsRow?.total_kwh, 0)
+           const totalCost = toNumber(totalsRow?.total_cost, 0)
+           const recordsCount = toNumber(totalsRow?.records_count, 0)
+       
+           const maxDayRow = await ConsumptionRecord.findOne({
+             where,
+             attributes: [
+               'record_date',
+               [sequelize.fn('SUM', sequelize.col('consumption_kwh')), 'day_kwh'],
+               [sequelize.fn('SUM', sequelize.col('cost')), 'day_cost']
+             ],
+             group: ['record_date'],
+             order: [[sequelize.literal('day_kwh'), 'DESC']],
+             raw: true
+           })
+       
+           const maxDay = maxDayRow
+             ? {
+                 date: String(maxDayRow.record_date),
+                 kwh: toNumber(maxDayRow.day_kwh, 0),
+                 cost: toNumber(maxDayRow.day_cost, 0)
+               }
+             : null
+       
+           const averages = {
+             kwh_per_day: days > 0 ? Number((totalKwh / days).toFixed(4)) : 0,
+             cost_per_day: days > 0 ? Number((totalCost / days).toFixed(4)) : 0,
+             kwh_per_record: recordsCount > 0 ? Number((totalKwh / recordsCount).toFixed(4)) : 0,
+             cost_per_record: recordsCount > 0 ? Number((totalCost / recordsCount).toFixed(4)) : 0
+           }
+       
+           res.json({
+             period: { date_from: dateFrom, date_to: dateTo, days },
+             totals: { total_kwh: totalKwh, total_cost: totalCost, records_count: recordsCount },
+             averages,
+             max_day: maxDay
+           })
+         } catch (e) {
+           next(e)
+         }
+       })
+
+
+     3.1.3 Обчислення вартості споживання на основі тарифів
+     Однією з центральних задач системи є перетворення обсягу споживання у грошовий еквівалент. Для цього сервер отримує активний тариф користувача та виконує множення сумарного споживання на тарифну ставку. Такий підхід забезпечує єдину точку істини для розрахунків і дозволяє коректно відображати витрати у записах споживання та у звітах. Цей фрагмент стосується додавання нового запису споживання:
+router.post('/', auth, async (req, res, next) => {
+  try {
+    const { appliance_id, consumption_kwh, usage_hours, record_date, notes } = req.body || {}
+
+    const hasKwh = consumption_kwh !== undefined && consumption_kwh !== null
+    const hasHours = usage_hours !== undefined && usage_hours !== null
+
+    if (hasKwh && hasHours) {
+    return res.status(400).json({ message: 'Provide either consumption_kwh or usage_hours, not both' })
+    }
+
+    const date = String(record_date || '')
+    if (!isValidISODate(date)) {
+      return res.status(400).json({ message: 'record_date is required (YYYY-MM-DD)' })
+    }
+
+    const tCheck = await getActiveTariffStrict(req.user.id)
+    if (!tCheck.ok) {
+      if (tCheck.code === 'NO_ACTIVE') {
+        return res.status(400).json({
+          message: 'No active tariff. Please create a tariff and set it as active.'
+        })
+      }
+      return res.status(409).json({
+        message: 'More than one active tariff found. Please leave only one active tariff.',
+        active_tariff_ids: tCheck.ids
+      })
+    }
+    const activeTariff = tCheck.tariff
+
+    let appliance = null
+    if (appliance_id !== undefined && appliance_id !== null) {
+      appliance = await Appliance.findOne({
+        where: { id: Number(appliance_id), user_id: req.user.id }
+      })
+      if (!appliance) return res.status(404).json({ message: 'appliance not found' })
+    }
+
+    const kwhResult = computeKwh({ consumption_kwh, usage_hours, appliance })
+    if (kwhResult.error) return res.status(400).json({ message: kwhResult.error })
+
+    const price = toNumber(activeTariff.price_per_kwh)
+    if (!Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ message: 'Active tariff price_per_kwh is invalid' })
+    }
+
+    const kwhStr = decimalString(kwhResult.kwh, 3)
+    const priceStr = decimalString(price, 4)
+    const costStr = decimalString(toNumber(kwhStr) * toNumber(priceStr), 4)
+
+    const created = await ConsumptionRecord.create({
+      user_id: req.user.id,
+      appliance_id: appliance ? appliance.id : null,
+      consumption_kwh: kwhStr,
+      applied_price_per_kwh: priceStr,
+      cost: costStr,
+      record_date: date,
+      notes: notes || null
+    })
+
+    res.status(201).json(created)
+  } catch (e) {
+    next(e)
+  }
+})
+     3.1.4 Розрахунки по приладах та деталізація звітів
+     Для більш глибокої аналітики важливо не лише загальне споживання, а й розподіл по окремих приладах. Тому сервер виконує групування або фільтрацію даних за appliance_id і формує деталізовані підсумки. Це дозволяє визначати найбільш «витратні» прилади та аналізувати структуру споживання. Код що відповідає за формування звіту з групуваннями по приладам:
+router.get('/export/by-appliance.csv', auth, async (req, res, next) => {
+  try {
+    const period = requirePeriod(req, res)
+    if (!period) return
+    const { dateFrom, dateTo } = period
+
+    const where = buildWhere(req.user.id, dateFrom, dateTo)
+
+    const grouped = await ConsumptionRecord.findAll({
+      where,
+      attributes: [
+        'appliance_id',
+        [sequelize.fn('SUM', sequelize.col('consumption_kwh')), 'total_kwh'],
+        [sequelize.fn('SUM', sequelize.col('cost')), 'total_cost'],
+        [sequelize.fn('COUNT', sequelize.col('id')), 'records_count']
+      ],
+      group: ['appliance_id'],
+      order: [[sequelize.literal('total_cost'), 'DESC']],
+      raw: true
+    })
+
+    const ids = grouped
+      .map((g) => g.appliance_id)
+      .filter((id) => id !== null && id !== undefined)
+      .map((id) => Number(id))
+
+    const appliances = ids.length
+      ? await Appliance.findAll({
+          where: { user_id: req.user.id, id: { [Op.in]: ids } },
+          attributes: ['id', 'name'],
+          raw: true
+        })
+      : []
+
+    const nameById = new Map(appliances.map((a) => [Number(a.id), a.name]))
+
+    const normalized = grouped.map((g) => {
+      const apId = g.appliance_id == null ? null : Number(g.appliance_id)
+      return {
+        appliance_id: apId,
+        appliance_name: apId == null ? '' : (nameById.get(apId) || ''),
+        total_kwh: toNumber(g.total_kwh, 0),
+        total_cost: toNumber(g.total_cost, 0),
+        records_count: toNumber(g.records_count, 0)
+      }
+    })
+
+    const headers = ['appliance_id', 'appliance_name', 'total_kwh', 'total_cost', 'records_count']
+    const csv = toCsv(headers, normalized, ';')
+    sendCsv(res, `report_by_appliance_${dateFrom}_to_${dateTo}.csv`, csv)
+  } catch (e) {
+    next(e)
+  }
+})
+Допоміжні функції формування звіту для експорту:
+       function toCsv(headers, rows, delimiter = ';') {
+  const sepLine = `sep=${delimiter}\n`
+  const head = headers.map(csvEscape).join(delimiter)
+  const body = rows
+    .map((r) => headers.map((h) => csvEscape(r[h])).join(delimiter))
+    .join('\n')
+
+  return `\uFEFF${sepLine}${head}\n${body}\n`
+}
+
+function sendCsv(res, filename, csvText) {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+  res.send(csvText)
+}
+     3.1.5 Перевірка лімітів та порівняння фактичних значень з обмеженнями
+     Система підтримує контроль лімітів, що вимагає порівняння фактичного споживання з установленими обмеженнями. Сервер отримує ліміт і виконує перевірку перевищення на основі агрегованих даних за відповідний період. У разі перевищення або наближення до ліміту система може формувати відповідні ознаки у відповіді. Отримання статусу прогресу ліміту:
+router.get('/:id/progress', auth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id)
+    const limit = await Limit.findOne({ where: { id, user_id: req.user.id } })
+    if (!limit) return res.status(404).json({ message: 'not found' })
+
+    const start = String(limit.period_start)
+    const end = String(limit.period_end)
+
+    const sum = await ConsumptionRecord.sum('consumption_kwh', {
+      where: {
+        user_id: req.user.id,
+        record_date: { [Op.between]: [start, end] }
+      }
+    })
+
+    const used = Number(sum || 0)
+    const limitKwh = toNumber(limit.limit_kwh)
+    const percent = Number.isFinite(limitKwh) && limitKwh > 0 ? (used / limitKwh) * 100 : null
+
+    const threshold = Number(limit.alert_threshold_percent || 80)
+    const alertEnabled = Boolean(limit.alert_enabled)
+
+    const thresholdReached = alertEnabled && percent != null && percent >= threshold
+    const exceeded = percent != null && percent >= 100
+
+    res.json({
+      limit_id: limit.id,
+      period_type: limit.period_type,
+      period_start: start,
+      period_end: end,
+      limit_kwh: String(limit.limit_kwh),
+      used_kwh: used.toFixed(3),
+      percent_used: percent == null ? null : Number(percent.toFixed(2)),
+      alert_enabled: alertEnabled,
+      alert_threshold_percent: threshold,
+      threshold_reached: thresholdReached,
+      limit_exceeded: exceeded
+    })
+  } catch (e) {
+    next(e)
+  }
+})
+     3.1.6 Керування тарифами та забезпечення єдиного активного тарифу
+     У розробленій системі тариф описує вартість 1 кВт*год та може мати період дії через поля valid_from і valid_to. Для коректного розрахунку вартості споживання в кожен момент часу має використовуватися лише один активний тариф користувача. Саме тому серверна логіка гарантує, що для одного user_id одночасно не існує декількох записів з is_active = true. Якщо створюється або активується новий тариф, усі інші тарифи цього користувача автоматично деактивуються. Також перед активацією виконується перевірка, що поточна дата входить у період дії тарифу, щоб не допустити ситуації, коли активним стає тариф, який ще не почав діяти або вже завершився. Найкраще це видно при додаванні нового тарифу:
+router.post('/', auth, async (req, res, next) => {
+  try {
+    const { tariff_name, price_per_kwh, valid_from, valid_to, is_active } = req.body || {}
+
+    if (!tariff_name || price_per_kwh == null || !valid_from) {
+      return res.status(400).json({ message: 'tariff_name, price_per_kwh, valid_from are required' })
+    }
+
+    if (valid_to && isAfter(valid_from, valid_to)) {
+      return res.status(400).json({ message: 'valid_from cannot be after valid_to' })
+    }
+
+    const makeActive = is_active !== false
+
+    if (makeActive) {
+      const check = assertCanBeActiveNow(valid_from, valid_to || null)
+      if (!check.ok) return res.status(400).json({ message: check.message })
+    }
+
+    const created = await sequelize.transaction(async (t) => {
+      const newRow = await Tariff.create({
+        user_id: req.user.id,
+        tariff_name,
+        price_per_kwh,
+        valid_from,
+        valid_to: valid_to || null,
+        is_active: makeActive
+      }, { transaction: t })
+
+      if (makeActive) {
+        await Tariff.update(
+          { is_active: false },
+          { where: { user_id: req.user.id, id: { [Op.ne]: newRow.id } }, transaction: t }
+        )
+      }
+
+      return newRow
+    })
+
+    res.status(201).json(created)
+  } catch (e) {
+    next(e)
+  }
+})
+     3.2 Фрагменти коду адміністрування серверної частини
+     3.2.1  Авторизація та обмеження доступу до адміністративного API
+     Для адміністративних операцій у системі застосовано два послідовні рівні перевірок. Спочатку виконується загальна авторизація за JWT-токеном, після чого перевіряється роль користувача. Додатково на рівні авторизаційного middleware враховано блокування облікового запису, щоб заблокований користувач не міг викликати API навіть за наявності валідного токена. Доступ до адміністративних ендпоінтів надається лише користувачам із роллю admin, що забезпечує розмежування прав і захист від несанкціонованих дій. src/middleware/auth.js:
+       import jwt from 'jsonwebtoken'
+       import { User } from '../models/index.js'
+       
+       export async function auth(req, res, next) {
+         const header = req.headers.authorization || ''
+         const token = header.startsWith('Bearer ') ? header.slice(7) : null
+         if (!token) return res.status(401).json({ message: 'Unauthorized' })
+       
+         try {
+           const payload = jwt.verify(token, process.env.JWT_SECRET)
+       
+           const user = await User.findByPk(payload.userId, {
+             attributes: ['id', 'role', 'is_blocked']
+           })
+       
+           if (!user) return res.status(401).json({ message: 'Unauthorized' })
+           if (user.is_blocked) return res.status(403).json({ message: 'User is blocked' })
+       
+           req.user = {
+             id: user.id,
+             role: user.role
+           }
+       
+           next()
+         } catch {
+           return res.status(401).json({ message: 'Invalid token' })
+         }
+       }
+       
+       export function requireAdmin(req, res, next) {
+         if (!req.user) return res.status(401).json({ message: 'Unauthorized' })
+         if (req.user.role !== 'admin') return res.status(403).json({ message: 'Admin only' })
+         next()
+       }
+Підключення:
+const router = Router()
+router.use(auth)
+router.use(requireAdmin)
+     3.2.2  Перегляд списку користувачів із фільтрацією та пагінацією
+     Адміністратор може отримати перелік користувачів із можливістю пошуку за підрядком email, фільтрації за роллю та статусом блокування. Для зменшення навантаження й зручності інтерфейсу використано пагінацію через параметри limit та offset. Значення параметрів проходять валідацію, а для is_blocked виконується коректне перетворення з рядкових значень, які приходять у запиті. Результат повертається у вигляді структури з total, limit, offset та масивом items. Фрагмент коду, що відповідає за отримання користувачів:
+       const ROLES = new Set(['user', 'admin'])
+       
+       function parseBool(v) {
+         if (v === true || v === false) return v
+         if (v === 1 || v === 0) return Boolean(v)
+         if (typeof v === 'string') {
+           if (v === 'true') return true
+           if (v === 'false') return false
+           if (v === '1') return true
+           if (v === '0') return false
+         }
+         return null
+       }
+       
+       router.get('/users', async (req, res, next) => {
+         try {
+           const q = req.query.q != null ? String(req.query.q).trim() : ''
+           const role = req.query.role != null ? String(req.query.role).trim() : null
+           const isBlockedRaw = req.query.is_blocked != null ? req.query.is_blocked : null
+       
+           const limitRaw = req.query.limit != null ? Number(req.query.limit) : 50
+           const offsetRaw = req.query.offset != null ? Number(req.query.offset) : 0
+           const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(1, limitRaw), 200) : 50
+           const offset = Number.isFinite(offsetRaw) ? Math.max(0, offsetRaw) : 0
+       
+           if (role && !ROLES.has(role)) {
+             return res.status(400).json({ message: 'role must be user or admin' })
+           }
+       
+           const where = {}
+           if (q) where.email = { [Op.like]: `%${q}%` }
+           if (role) where.role = role
+       
+           if (isBlockedRaw != null) {
+             const parsed = parseBool(isBlockedRaw)
+             if (parsed == null) return res.status(400).json({ message: 'is_blocked must be boolean' })
+             where.is_blocked = parsed
+           }
+       
+           const result = await User.findAndCountAll({
+             where,
+             attributes: ['id', 'email', 'role', 'is_blocked', 'created_at'],
+             order: [['id', 'ASC']],
+             limit,
+             offset
+           })
+       
+           res.json({
+             total: result.count,
+             limit,
+             offset,
+             items: result.rows
+           })
+         } catch (e) {
+           next(e)
+         }
+       })
+     3.2.3  Зміна ролі користувача та захист від втрати адміністративного доступу
+     Функція зміни ролі реалізована як адміністративна операція, яка дозволяє встановити користувачу роль user або admin. У реалізації передбачено перевірку валідності id та значення ролі. Окремо додано обмеження, яке забороняє адміністратору знижувати власну роль, щоб не втратити доступ до адміністрування під час активної сесії. Додатково реалізовано захист від ситуації, коли в системі може залишитися нуль активних адміністраторів. Якщо користувач-адміністратор є останнім активним, зміна його ролі блокується як конфліктна операція. Після успішного оновлення рольова зміна фіксується в журналі аудиту.
+async function countActiveAdmins() {
+  return User.count({ where: { role: 'admin', is_blocked: false } })
+}
+
+async function writeAudit(req, action, targetUserId = null, detailsObj = null) {
+  try {
+    await AuditLog.create({
+      admin_id: req.user.id,
+      action,
+      target_user_id: targetUserId,
+      details: detailsObj ? JSON.stringify(detailsObj) : null
+    })
+  } catch (e) {
+    console.error('AuditLog write failed:', e)
+  }
+}
+router.patch('/users/:id/role', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: 'invalid id' })
+    }
+
+    const nextRole = String((req.body || {}).role || '').trim()
+    if (!ROLES.has(nextRole)) {
+      return res.status(400).json({ message: 'role must be user or admin' })
+    }
+
+    if (id === req.user.id && nextRole !== 'admin') {
+    return res.status(400).json({ message: 'cannot change own role' })
+    }
+
+    const user = await User.findByPk(id, {
+      attributes: ['id', 'email', 'role', 'is_blocked', 'created_at']
+    })
+    if (!user) return res.status(404).json({ message: 'not found' })
+
+    if (user.role === 'admin' && nextRole !== 'admin') {
+    const activeAdmins = await countActiveAdmins()
+    if (activeAdmins <= 1) {
+        return res.status(409).json({ message: 'cannot remove role from the last active admin' })
+    }
+    }
+
+    const prevRole = user.role
+    await user.update({ role: nextRole })
+
+    await writeAudit(req, 'USER_ROLE_CHANGE', user.id, {
+      from: prevRole,
+      to: nextRole,
+      email: user.email
+    })
+
+    res.json(user)
+  } catch (e) {
+    next(e)
+  }
+})
+     3.2.4  Блокування та розблокування користувачів із перевірками безпеки
+     Адміністратор може змінювати стан блокування для користувачів системи. Перед оновленням реалізовано перевірку коректності id і значення is_blocked. Також додано захист від блокування власного облікового запису, щоб не створити ситуацію втрати доступу до системи в рамках поточної авторизації. Для адміністраторів застосовано додаткове правило безпеки. Якщо адміністратор є останнім активним, то його блокування забороняється. Після успішної операції система фіксує дію в аудит-логах, зберігаючи попереднє і нове значення статусу.
+router.patch('/users/:id/block', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id)
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: 'invalid id' })
+    }
+
+    const parsed = parseBool((req.body || {}).is_blocked)
+    if (parsed == null) {
+      return res.status(400).json({ message: 'is_blocked must be boolean' })
+    }
+
+    if (parsed === true && id === req.user.id) {
+      return res.status(400).json({ message: 'cannot block own account' })
+    }
+
+    const user = await User.findByPk(id, {
+      attributes: ['id', 'email', 'role', 'is_blocked', 'created_at']
+    })
+    if (!user) return res.status(404).json({ message: 'not found' })
+
+    if (parsed === true && user.role === 'admin') {
+      const activeAdmins = await countActiveAdmins()
+      if (activeAdmins <= 1) {
+        return res.status(409).json({ message: 'cannot block the last active admin' })
+      }
+    }
+
+    const prevBlocked = user.is_blocked
+    await user.update({ is_blocked: parsed })
+    await writeAudit(req, parsed ? 'USER_BLOCK' : 'USER_UNBLOCK', user.id, {
+      from: prevBlocked,
+      to: parsed,
+      email: user.email
+    })
+    res.json(user)
+  } catch (e) {
+    next(e)
+  }
+})
+     3.2.5  Отримання статистики щодо облікових записів і блокувань
+     Для оперативного контролю стану системи передбачено ендпоінт статистики, який повертає кількість усіх акаунтів, кількість заблокованих, а також окремі підрахунки для ролей user і admin. Реалізація використовує паралельне виконання запитів підрахунку, що зменшує час відповіді. Отримані дані повертаються у вигляді структурованого JSON-об’єкта.
+router.get('/stats', async (req, res, next) => {
+  try {
+    const [
+      accountsTotal,
+      accountsBlockedTotal,
+      usersTotal,
+      usersBlockedTotal,
+      adminsTotal,
+      adminsBlockedTotal
+    ] = await Promise.all([
+      User.count(),
+      User.count({ where: { is_blocked: true } }),
+      User.count({ where: { role: 'user' } }),
+      User.count({ where: { role: 'user', is_blocked: true } }),
+      User.count({ where: { role: 'admin' } }),
+      User.count({ where: { role: 'admin', is_blocked: true } })
+    ])
+
+    res.json({
+      accounts_total: accountsTotal,
+      accounts_blocked_total: accountsBlockedTotal,
+      users_total: usersTotal,
+      users_blocked_total: usersBlockedTotal,
+      admins_total: adminsTotal,
+      admins_blocked_total: adminsBlockedTotal
+    })
+  } catch (e) {
+    next(e)
+  }
+})
+     3.2.6  Журнал аудиту дій адміністраторів і перегляд історії
+     Для забезпечення прозорості адміністрування реалізовано зберігання дій адміністраторів у таблиці audit_logs. Запис аудиту включає ідентифікатор адміністратора, тип дії, опціональний ідентифікатор цільового користувача та додаткові деталі у вигляді текстового поля. На рівні моделі використано прив’язку details до фізичної колонки meta. Запис у журнал виконується через окрему функцію writeAudit, яка обгорнута try/catch, щоб у разі проблем із логуванням основна адміністративна операція не була зірвана. Для перегляду історії дій реалізовано ендпоінт audit-logs із фільтрацією за конкретним admin_id і підтримкою пагінації. Для зручності відображення підтягуються email адміністратора та email цільового користувача через зв’язки моделі AuditLog з моделлю User. Сама модель AuditLog.js:
+       import { DataTypes } from 'sequelize'
+       import { sequelize } from '../config/db.js'
+       
+       export const AuditLog = sequelize.define('AuditLog', {
+         id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+         admin_id: { type: DataTypes.INTEGER, allowNull: false },
+         action: { type: DataTypes.STRING(64), allowNull: false },
+         target_user_id: { type: DataTypes.INTEGER, allowNull: true },
+         details: { type: DataTypes.TEXT('long'), allowNull: true, field: 'meta' },
+         created_at: { type: DataTypes.DATE, defaultValue: DataTypes.NOW }
+       }, {
+         tableName: 'audit_logs',
+         timestamps: false
+       })
+Зв’язки AuditLog з User у index.js:
+AuditLog.belongsTo(User, { foreignKey: 'admin_id', as: 'admin' })
+AuditLog.belongsTo(User, { foreignKey: 'target_user_id', as: 'target_user' })
+
+Ендпоінт перегляду логів:
+router.get('/audit-logs', async (req, res, next) => {
+  try {
+    const adminIdStr = req.query.admin_id != null ? String(req.query.admin_id).trim() : ''
+    const adminIdRaw = adminIdStr ? Number(adminIdStr) : null
+    const limitRaw = req.query.limit != null ? Number(req.query.limit) : 50
+    const offsetRaw = req.query.offset != null ? Number(req.query.offset) : 0
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(1, limitRaw), 200) : 50
+    const offset = Number.isFinite(offsetRaw) ? Math.max(0, offsetRaw) : 0
+
+    const where = {}
+    if (adminIdRaw != null) {
+      if (!Number.isInteger(adminIdRaw) || adminIdRaw <= 0) {
+        return res.status(400).json({ message: 'admin_id must be positive integer' })
+      }
+      where.admin_id = adminIdRaw
+    }
+    const result = await AuditLog.findAndCountAll({
+      where,
+      attributes: ['id', 'admin_id', 'action', 'target_user_id', 'details', 'created_at'],
+      include: [
+        { model: User, as: 'admin', attributes: ['id', 'email'] },
+        { model: User, as: 'target_user', attributes: ['id', 'email'] }
+      ],
+      order: [['id', 'DESC']],
+      limit,
+      offset
+    })
+
+    res.json({
+      total: result.count,
+      limit,
+      offset,
+      items: result.rows
+    })
+  } catch (e) {
+    next(e)
+  }
+})
+Реалізація функції writeAudit (див. п.3.2.3).
+    4 UML діаграми
+     4.1 UML діаграма діяльності для серверної частини
+     UML діаграма діяльності відображає покроковий алгоритм виконання запиту на сервері та показує, які рішення приймаються на різних етапах обробки. Для серверної частини розробленої системи така діаграма зручно описує типову послідовність, яка повторюється для більшості захищених ендпоінтів. Спочатку надходить HTTP-запит від клієнта до маршрутизатора Express, після чого виконується перевірка автентифікації через middleware auth, де токен витягається із заголовка Authorization і валідується. Далі перевіряється стан облікового запису, зокрема ознака блокування, щоб виключити виконання операцій заблокованими користувачами. Після успішної автентифікації для адміністративних операцій додатково виконується перевірка прав доступу через requireAdmin, яка дозволяє продовжити обробку лише для ролі admin.
+     Після проходження middleware запускається обробник конкретного ендпоінту, де виконуються прикладні перевірки та валідація вхідних даних. На прикладі операції блокування користувача це включає перевірку коректності ідентифікатора, перевірку, що адміністратор не блокує власний обліковий запис, а також захист від блокування останнього активного адміністратора. Далі виконується звернення до бази даних через моделі Sequelize для отримання користувача, оновлення поля is_blocked і формування відповіді. Паралельно з основною дією виконується фіксація адміністративної події в журналі аудиту, що дозволяє зберігати історію змін і надалі переглядати її через окремий ендпоінт. Таким чином, діаграма діяльності узагальнює бізнес-правила і контроль доступу у вигляді зрозумілого алгоритму з альтернативними гілками для помилкових випадків.
+
+Рис.1 – UML діаграма діяльності (блокування користувача адміністратором)
+     4.2 UML діаграма взаємодії для серверної частини
+     UML діаграма взаємодії (послідовності) показує обмін повідомленнями між учасниками процесу під час виконання запиту та підкреслює, хто саме виконує кожну дію. Для серверної частини системи така діаграма відображає, як клієнт взаємодіє з Express Router, як послідовно спрацьовують middleware auth і requireAdmin, а також як обробник ендпоінту викликає методи моделей для читання та зміни даних у MySQL. На діаграмі фіксуються ключові виклики, наприклад перевірка JWT, отримання користувача з таблиці users, виконання підрахунку активних адміністраторів для захисного правила, оновлення поля is_blocked і створення запису в таблиці audit_logs. Важливо, що діаграма взаємодії показує не лише основний успішний сценарій, а й альтернативні гілки, де сервер повертає 401 при відсутності або невалідному токені, 403 при відсутності прав адміністратора, 404 якщо користувача не знайдено, або 409 якщо операція порушує правило останнього активного адміністратора».
+
+
+Рис.2 – UML діаграма взаємодії (блокування користувача адміністратором)
+
+
+ДОДАТОК А
+Посилання на відео: https://youtu.be/9cPP5vC1GEs
